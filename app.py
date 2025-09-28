@@ -96,8 +96,13 @@ class PDFExtractor:
                 'total_brut': self.extract_total_gross(text),
                 'taux_tva': '20%',
                 'devise': 'EUR',
-                'lignes_detail': self.extract_line_items(text)
+                'lignes_detail': self.extract_line_items(text),
+                'rubriques_analyse': None  # Sera calculé après
             }
+            
+            # Analyser les rubriques si on a des lignes de détail
+            if data['lignes_detail']:
+                data['rubriques_analyse'] = self.analyze_rubriques(data['lignes_detail'])
             
             return data
             
@@ -240,32 +245,136 @@ class PDFExtractor:
         return None
     
     def extract_line_items(self, text: str) -> List[Dict]:
-        """Extrait les lignes de détail"""
+        """Extrait les lignes de détail avec analyse des rubriques"""
         lines = []
         
-        # Pattern pour les lignes de facture
-        line_pattern = r'(\d{4}_\d{5}_[^0-9]*?)\s+(\d{4}/\d{2}/\d{2})\s+(\w+)\s+([\d,\.]+)\s+(\d+)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)'
+        # Pattern pour les lignes de facture (amélioré pour capturer plus d'infos)
+        line_patterns = [
+            # Pattern principal pour lignes détaillées
+            r'(\d{4}_\d{5}_[^0-9]*?)\s+(\d{4}/\d{2}/\d{2})\s+(\w+)\s+([\d,\.]+)\s+(\d+)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)',
+            # Pattern alternatif pour autres formats
+            r'(\d{4}_\d{5}_[^\s]+)\s+(\d{4}/\d{2}/\d{2})\s+(\w+)\s+([\d,\.]+)\s+(\d+)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)'
+        ]
         
-        matches = re.finditer(line_pattern, text)
-        
-        for match in matches:
-            try:
-                line_data = {
-                    'description': match.group(1).strip(),
-                    'date_periode': match.group(2),
-                    'unite': match.group(3),
-                    'prix_unitaire': self.normalize_amount(match.group(4)),
-                    'quantite': int(match.group(5)),
-                    'montant_net': self.normalize_amount(match.group(6)),
-                    'montant_tva': self.normalize_amount(match.group(7)),
-                    'montant_brut': self.normalize_amount(match.group(8))
-                }
-                lines.append(line_data)
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Erreur lors de l'extraction d'une ligne: {e}")
-                continue
+        for pattern in line_patterns:
+            matches = re.finditer(pattern, text, re.MULTILINE)
+            
+            for match in matches:
+                try:
+                    description = match.group(1).strip()
+                    
+                    # Extraire les informations de la description
+                    batch_id, assignment_id, type_prestation = self.parse_description(description)
+                    
+                    line_data = {
+                        'description': description,
+                        'batch_id': batch_id,
+                        'assignment_id': assignment_id,
+                        'type_prestation': type_prestation,
+                        'code_rubrique': self.extract_rubrique_code(description, text),
+                        'date_periode': match.group(2),
+                        'unite': match.group(3),
+                        'prix_unitaire': self.normalize_amount(match.group(4)),
+                        'quantite': int(match.group(5)),
+                        'montant_net': self.normalize_amount(match.group(6)),
+                        'montant_tva': self.normalize_amount(match.group(7)),
+                        'montant_brut': self.normalize_amount(match.group(8))
+                    }
+                    lines.append(line_data)
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Erreur lors de l'extraction d'une ligne: {e}")
+                    continue
         
         return lines
+    
+    def parse_description(self, description: str) -> Tuple[str, str, str]:
+        """Parse la description pour extraire Batch ID, Assignment ID et type de prestation"""
+        try:
+            # Pattern: 4973_65744_Temporary employees - Expense
+            parts = description.split('_')
+            if len(parts) >= 3:
+                batch_id = parts[0]
+                assignment_id = parts[1]
+                type_part = '_'.join(parts[2:])
+                
+                # Identifier le type de prestation
+                if 'Expense' in type_part:
+                    type_prestation = 'Expense'
+                elif 'Timesheet' in type_part:
+                    type_prestation = 'Timesheet'
+                else:
+                    type_prestation = 'Autre'
+                
+                return batch_id, assignment_id, type_prestation
+            else:
+                return None, None, 'Non déterminé'
+        except Exception:
+            return None, None, 'Non déterminé'
+    
+    def extract_rubrique_code(self, description: str, full_text: str) -> Optional[str]:
+        """Extrait le code rubrique (ex: OT125) depuis la description ou le texte complet"""
+        # Chercher dans la description d'abord
+        rubrique_patterns = [
+            r'([A-Z]{2}\d{3})',  # Pattern OT125
+            r'Code rubrique[^A-Z]*([A-Z]{2}\d{3})',
+            r'rubrique[^A-Z]*([A-Z]{2}\d{3})'
+        ]
+        
+        for pattern in rubrique_patterns:
+            match = re.search(pattern, description, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        # Si pas trouvé dans description, chercher dans le texte complet
+        for pattern in rubrique_patterns:
+            match = re.search(pattern, full_text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def analyze_rubriques(self, lines: List[Dict]) -> List[Dict]:
+        """Analyse et regroupe les données par rubrique"""
+        rubriques_data = {}
+        
+        for line in lines:
+            # Créer une clé unique pour chaque rubrique/type
+            rubrique_key = f"{line.get('code_rubrique', 'SANS_CODE')}_{line.get('type_prestation', 'SANS_TYPE')}"
+            
+            if rubrique_key not in rubriques_data:
+                rubriques_data[rubrique_key] = {
+                    'code_rubrique': line.get('code_rubrique', 'Non déterminé'),
+                    'type_prestation': line.get('type_prestation', 'Non déterminé'),
+                    'batch_id': line.get('batch_id'),
+                    'assignment_id': line.get('assignment_id'),
+                    'nb_lignes': 0,
+                    'total_quantite': 0,
+                    'total_net': 0,
+                    'total_tva': 0,
+                    'total_brut': 0,
+                    'unites': set(),
+                    'periodes': set()
+                }
+            
+            # Agrégation des données
+            rubrique = rubriques_data[rubrique_key]
+            rubrique['nb_lignes'] += 1
+            rubrique['total_quantite'] += line.get('quantite', 0)
+            rubrique['total_net'] += line.get('montant_net', 0) or 0
+            rubrique['total_tva'] += line.get('montant_tva', 0) or 0
+            rubrique['total_brut'] += line.get('montant_brut', 0) or 0
+            
+            if line.get('unite'):
+                rubrique['unites'].add(line['unite'])
+            if line.get('date_periode'):
+                rubrique['periodes'].add(line['date_periode'])
+        
+        # Convertir les sets en strings pour l'export
+        for rubrique in rubriques_data.values():
+            rubrique['unites'] = ', '.join(sorted(rubrique['unites'])) if rubrique['unites'] else ''
+            rubrique['periodes'] = ', '.join(sorted(rubrique['periodes'])) if rubrique['periodes'] else ''
+        
+        return list(rubriques_data.values())
     
     def process_files(self, uploaded_files) -> List[Dict]:
         """Traite tous les fichiers uploadés"""
@@ -288,7 +397,7 @@ class PDFExtractor:
         return self.extracted_data
     
     def create_excel_report(self) -> io.BytesIO:
-        """Crée un rapport Excel avec les données extraites"""
+        """Crée un rapport Excel avec les données extraites incluant l'analyse par rubriques"""
         output = io.BytesIO()
         
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -307,6 +416,8 @@ class PDFExtractor:
                     'Total_Net_EUR': data['total_net'],
                     'Total_TVA_EUR': data['total_tva'],
                     'Total_Brut_EUR': data['total_brut'],
+                    'Nb_Lignes_Detail': len(data['lignes_detail']) if data['lignes_detail'] else 0,
+                    'Nb_Rubriques': len(data['rubriques_analyse']) if data['rubriques_analyse'] else 0,
                     'Devise': data['devise'],
                     'Erreur': data.get('erreur', '')
                 })
@@ -314,7 +425,7 @@ class PDFExtractor:
             df_summary = pd.DataFrame(summary_data)
             df_summary.to_excel(writer, sheet_name='Résumé_Factures', index=False)
             
-            # Feuille 2: Détail des lignes
+            # Feuille 2: Détail des lignes (enrichi avec rubriques)
             detail_data = []
             for data in self.extracted_data:
                 if data['lignes_detail']:
@@ -323,6 +434,10 @@ class PDFExtractor:
                             'Nom_Fichier': data['nom_fichier'],
                             'Numero_Facture': data['numero_facture'],
                             'Numero_Commande': data['numero_commande'],
+                            'Batch_ID': line.get('batch_id', ''),
+                            'Assignment_ID': line.get('assignment_id', ''),
+                            'Code_Rubrique': line.get('code_rubrique', ''),
+                            'Type_Prestation': line.get('type_prestation', ''),
                             'Description': line['description'],
                             'Date_Periode': line['date_periode'],
                             'Unite': line['unite'],
@@ -338,6 +453,10 @@ class PDFExtractor:
                         'Nom_Fichier': data['nom_fichier'],
                         'Numero_Facture': data['numero_facture'],
                         'Numero_Commande': data['numero_commande'],
+                        'Batch_ID': data['batch_id'],
+                        'Assignment_ID': data['assignment_id'],
+                        'Code_Rubrique': '',
+                        'Type_Prestation': 'Total facture',
                         'Description': 'Total facture',
                         'Date_Periode': data['date_facture'],
                         'Unite': 'Global',
@@ -367,11 +486,82 @@ class PDFExtractor:
                     'Total_TVA': data['total_tva'],
                     'Total_Brut': data['total_brut'],
                     'Nb_Lignes': len(data['lignes_detail']) if data['lignes_detail'] else 1,
+                    'Nb_Rubriques': len(data['rubriques_analyse']) if data['rubriques_analyse'] else 0,
                     'Statut_Extraction': 'Succès' if data['numero_facture'] else 'Partiel'
                 })
             
             df_analysis = pd.DataFrame(analysis_data)
             df_analysis.to_excel(writer, sheet_name='Donnees_Analyse', index=False)
+            
+            # NOUVELLE Feuille 4: Analyse par rubriques
+            rubriques_data = []
+            for data in self.extracted_data:
+                if data['rubriques_analyse']:
+                    for rubrique in data['rubriques_analyse']:
+                        rubriques_data.append({
+                            'Nom_Fichier': data['nom_fichier'],
+                            'Numero_Facture': data['numero_facture'],
+                            'Numero_Commande': data['numero_commande'],
+                            'Code_Rubrique': rubrique['code_rubrique'],
+                            'Type_Prestation': rubrique['type_prestation'],
+                            'Batch_ID': rubrique['batch_id'],
+                            'Assignment_ID': rubrique['assignment_id'],
+                            'Nb_Lignes': rubrique['nb_lignes'],
+                            'Total_Quantite': rubrique['total_quantite'],
+                            'Unites': rubrique['unites'],
+                            'Periodes': rubrique['periodes'],
+                            'Total_Net_EUR': rubrique['total_net'],
+                            'Total_TVA_EUR': rubrique['total_tva'],
+                            'Total_Brut_EUR': rubrique['total_brut'],
+                            'Pourcentage_Facture': round((rubrique['total_net'] / data['total_net']) * 100, 2) if data['total_net'] and data['total_net'] > 0 else 0
+                        })
+            
+            if rubriques_data:
+                df_rubriques = pd.DataFrame(rubriques_data)
+                df_rubriques.to_excel(writer, sheet_name='Analyse_Rubriques', index=False)
+            
+            # NOUVELLE Feuille 5: Synthèse par type de prestation
+            synthese_data = {}
+            for data in self.extracted_data:
+                if data['rubriques_analyse']:
+                    for rubrique in data['rubriques_analyse']:
+                        type_key = rubrique['type_prestation']
+                        if type_key not in synthese_data:
+                            synthese_data[type_key] = {
+                                'Type_Prestation': type_key,
+                                'Nb_Factures': 0,
+                                'Nb_Lignes_Total': 0,
+                                'Total_Net_EUR': 0,
+                                'Total_TVA_EUR': 0,
+                                'Total_Brut_EUR': 0,
+                                'Codes_Rubriques': set(),
+                                'Factures': set()
+                            }
+                        
+                        synthese = synthese_data[type_key]
+                        synthese['Nb_Lignes_Total'] += rubrique['nb_lignes']
+                        synthese['Total_Net_EUR'] += rubrique['total_net']
+                        synthese['Total_TVA_EUR'] += rubrique['total_tva']
+                        synthese['Total_Brut_EUR'] += rubrique['total_brut']
+                        synthese['Codes_Rubriques'].add(rubrique['code_rubrique'])
+                        synthese['Factures'].add(data['numero_facture'])
+            
+            # Convertir pour export
+            synthese_export = []
+            for synthese in synthese_data.values():
+                synthese_export.append({
+                    'Type_Prestation': synthese['Type_Prestation'],
+                    'Nb_Factures': len(synthese['Factures']),
+                    'Nb_Lignes_Total': synthese['Nb_Lignes_Total'],
+                    'Codes_Rubriques': ', '.join(sorted(synthese['Codes_Rubriques'])),
+                    'Total_Net_EUR': synthese['Total_Net_EUR'],
+                    'Total_TVA_EUR': synthese['Total_TVA_EUR'],
+                    'Total_Brut_EUR': synthese['Total_Brut_EUR']
+                })
+            
+            if synthese_export:
+                df_synthese = pd.DataFrame(synthese_export)
+                df_synthese.to_excel(writer, sheet_name='Synthese_Prestations', index=False)
         
         output.seek(0)
         return output
@@ -435,11 +625,90 @@ def main():
                     # Affichage des résultats
                     st.header("📊 Résultats de l'extraction")
                     
-                    # Statistiques
-                    col1, col2, col3, col4 = st.columns(4)
+                    # Statistiques enrichies
+                    col1, col2, col3, col4, col5 = st.columns(5)
                     
                     with col1:
                         st.metric("📄 Fichiers traités", len(extracted_data))
+                    
+                    with col2:
+                        success_count = sum(1 for d in extracted_data if d['numero_facture'])
+                        st.metric("✅ Extractions réussies", success_count)
+                    
+                    with col3:
+                        total_net = sum(d['total_net'] or 0 for d in extracted_data)
+                        st.metric("💰 Total Net (EUR)", f"{total_net:,.2f}")
+                    
+                    with col4:
+                        total_gross = sum(d['total_brut'] or 0 for d in extracted_data)
+                        st.metric("💰 Total Brut (EUR)", f"{total_gross:,.2f}")
+                    
+                    with col5:
+                        total_lignes = sum(len(d['lignes_detail']) if d['lignes_detail'] else 0 for d in extracted_data)
+                        st.metric("📋 Lignes extraites", total_lignes)
+                    
+                    # Nouvelle section : Analyse par rubriques
+                    st.subheader("🏷️ Analyse par rubriques")
+                    
+                    # Regrouper toutes les rubriques
+                    all_rubriques = []
+                    for data in extracted_data:
+                        if data['rubriques_analyse']:
+                            for rubrique in data['rubriques_analyse']:
+                                rubrique['numero_facture'] = data['numero_facture']
+                                all_rubriques.append(rubrique)
+                    
+                    if all_rubriques:
+                        # Créer un tableau synthétique par type de prestation
+                        types_prestations = {}
+                        for rubrique in all_rubriques:
+                            type_key = rubrique['type_prestation']
+                            if type_key not in types_prestations:
+                                types_prestations[type_key] = {
+                                    'nb_factures': 0,
+                                    'nb_lignes': 0,
+                                    'total_net': 0,
+                                    'total_brut': 0,
+                                    'factures': set()
+                                }
+                            
+                            types_prestations[type_key]['nb_lignes'] += rubrique['nb_lignes']
+                            types_prestations[type_key]['total_net'] += rubrique['total_net']
+                            types_prestations[type_key]['total_brut'] += rubrique['total_brut']
+                            types_prestations[type_key]['factures'].add(rubrique['numero_facture'])
+                        
+                        # Affichage des métriques par type
+                        st.markdown("**Répartition par type de prestation:**")
+                        cols = st.columns(len(types_prestations))
+                        
+                        for i, (type_name, stats) in enumerate(types_prestations.items()):
+                            with cols[i]:
+                                st.metric(
+                                    f"🔧 {type_name}",
+                                    f"{stats['total_net']:,.2f} €",
+                                    f"{stats['nb_lignes']} lignes"
+                                )
+                        
+                        # Tableau détaillé des rubriques
+                        rubriques_display = []
+                        for rubrique in all_rubriques:
+                            rubriques_display.append({
+                                'Facture': rubrique['numero_facture'],
+                                'Code Rubrique': rubrique['code_rubrique'] or '❌',
+                                'Type': rubrique['type_prestation'],
+                                'Lignes': rubrique['nb_lignes'],
+                                'Quantité': rubrique['total_quantite'],
+                                'Net (€)': f"{rubrique['total_net']:,.2f}",
+                                'Brut (€)': f"{rubrique['total_brut']:,.2f}"
+                            })
+                        
+                        if rubriques_display:
+                            st.dataframe(pd.DataFrame(rubriques_display), use_container_width=True)
+                    else:
+                        st.info("ℹ️ Aucune rubrique détaillée trouvée dans les PDFs")
+                    
+                    # Tableau de résultats principal
+                    st.subheader("📋 Détail des extractions")📄 Fichiers traités", len(extracted_data))
                     
                     with col2:
                         success_count = sum(1 for d in extracted_data if d['numero_facture'])
