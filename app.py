@@ -103,6 +103,10 @@ class PDFExtractor:
             # Analyser les rubriques si on a des lignes de détail
             if data['lignes_detail']:
                 data['rubriques_analyse'] = self.analyze_rubriques(data['lignes_detail'])
+                logger.info(f"Rubriques analysées pour {pdf_file.name}: {len(data['rubriques_analyse'])} rubriques trouvées")
+            else:
+                data['rubriques_analyse'] = []
+                logger.info(f"Aucune ligne de détail trouvée pour {pdf_file.name}")
             
             return data
             
@@ -496,40 +500,60 @@ class PDFExtractor:
             # NOUVELLE Feuille 4: Analyse par rubriques
             rubriques_data = []
             for data in self.extracted_data:
-                if data['rubriques_analyse']:
+                if data.get('rubriques_analyse') and len(data['rubriques_analyse']) > 0:
                     for rubrique in data['rubriques_analyse']:
                         rubriques_data.append({
                             'Nom_Fichier': data['nom_fichier'],
                             'Numero_Facture': data['numero_facture'],
                             'Numero_Commande': data['numero_commande'],
-                            'Code_Rubrique': rubrique['code_rubrique'],
-                            'Type_Prestation': rubrique['type_prestation'],
-                            'Batch_ID': rubrique['batch_id'],
-                            'Assignment_ID': rubrique['assignment_id'],
-                            'Nb_Lignes': rubrique['nb_lignes'],
-                            'Total_Quantite': rubrique['total_quantite'],
-                            'Unites': rubrique['unites'],
-                            'Periodes': rubrique['periodes'],
-                            'Total_Net_EUR': rubrique['total_net'],
-                            'Total_TVA_EUR': rubrique['total_tva'],
-                            'Total_Brut_EUR': rubrique['total_brut'],
-                            'Pourcentage_Facture': round((rubrique['total_net'] / data['total_net']) * 100, 2) if data['total_net'] and data['total_net'] > 0 else 0
+                            'Code_Rubrique': rubrique.get('code_rubrique', 'Non déterminé'),
+                            'Type_Prestation': rubrique.get('type_prestation', 'Non déterminé'),
+                            'Batch_ID': rubrique.get('batch_id', ''),
+                            'Assignment_ID': rubrique.get('assignment_id', ''),
+                            'Nb_Lignes': rubrique.get('nb_lignes', 0),
+                            'Total_Quantite': rubrique.get('total_quantite', 0),
+                            'Unites': rubrique.get('unites', ''),
+                            'Periodes': rubrique.get('periodes', ''),
+                            'Total_Net_EUR': rubrique.get('total_net', 0),
+                            'Total_TVA_EUR': rubrique.get('total_tva', 0),
+                            'Total_Brut_EUR': rubrique.get('total_brut', 0),
+                            'Pourcentage_Facture': round((rubrique.get('total_net', 0) / (data['total_net'] or 1)) * 100, 2) if data.get('total_net') and data['total_net'] > 0 else 0
                         })
+                else:
+                    # Si pas de rubriques détaillées, créer une ligne avec les totaux de la facture
+                    rubriques_data.append({
+                        'Nom_Fichier': data['nom_fichier'],
+                        'Numero_Facture': data['numero_facture'],
+                        'Numero_Commande': data['numero_commande'],
+                        'Code_Rubrique': 'TOTAL_FACTURE',
+                        'Type_Prestation': 'Global',
+                        'Batch_ID': data.get('batch_id', ''),
+                        'Assignment_ID': data.get('assignment_id', ''),
+                        'Nb_Lignes': len(data.get('lignes_detail', [])),
+                        'Total_Quantite': 1,
+                        'Unites': 'Facture complète',
+                        'Periodes': data.get('date_facture', ''),
+                        'Total_Net_EUR': data.get('total_net', 0),
+                        'Total_TVA_EUR': data.get('total_tva', 0),
+                        'Total_Brut_EUR': data.get('total_brut', 0),
+                        'Pourcentage_Facture': 100.0
+                    })
             
-            if rubriques_data:
-                df_rubriques = pd.DataFrame(rubriques_data)
-                df_rubriques.to_excel(writer, sheet_name='Analyse_Rubriques', index=False)
+            # Créer la feuille même si pas de données (avec en-têtes)
+            df_rubriques = pd.DataFrame(rubriques_data)
+            df_rubriques.to_excel(writer, sheet_name='Analyse_Rubriques', index=False)
             
             # NOUVELLE Feuille 5: Synthèse par type de prestation
             synthese_data = {}
+            total_factures_traitees = len(self.extracted_data)
+            
             for data in self.extracted_data:
-                if data['rubriques_analyse']:
+                if data.get('rubriques_analyse') and len(data['rubriques_analyse']) > 0:
                     for rubrique in data['rubriques_analyse']:
-                        type_key = rubrique['type_prestation']
+                        type_key = rubrique.get('type_prestation', 'Non déterminé')
                         if type_key not in synthese_data:
                             synthese_data[type_key] = {
                                 'Type_Prestation': type_key,
-                                'Nb_Factures': 0,
                                 'Nb_Lignes_Total': 0,
                                 'Total_Net_EUR': 0,
                                 'Total_TVA_EUR': 0,
@@ -539,29 +563,46 @@ class PDFExtractor:
                             }
                         
                         synthese = synthese_data[type_key]
-                        synthese['Nb_Lignes_Total'] += rubrique['nb_lignes']
-                        synthese['Total_Net_EUR'] += rubrique['total_net']
-                        synthese['Total_TVA_EUR'] += rubrique['total_tva']
-                        synthese['Total_Brut_EUR'] += rubrique['total_brut']
-                        synthese['Codes_Rubriques'].add(rubrique['code_rubrique'])
+                        synthese['Nb_Lignes_Total'] += rubrique.get('nb_lignes', 0)
+                        synthese['Total_Net_EUR'] += rubrique.get('total_net', 0)
+                        synthese['Total_TVA_EUR'] += rubrique.get('total_tva', 0)
+                        synthese['Total_Brut_EUR'] += rubrique.get('total_brut', 0)
+                        synthese['Codes_Rubriques'].add(rubrique.get('code_rubrique', 'Non déterminé'))
                         synthese['Factures'].add(data['numero_facture'])
             
             # Convertir pour export
             synthese_export = []
-            for synthese in synthese_data.values():
+            if synthese_data:
+                for synthese in synthese_data.values():
+                    synthese_export.append({
+                        'Type_Prestation': synthese['Type_Prestation'],
+                        'Nb_Factures': len(synthese['Factures']),
+                        'Nb_Lignes_Total': synthese['Nb_Lignes_Total'],
+                        'Codes_Rubriques': ', '.join(sorted(synthese['Codes_Rubriques'])),
+                        'Total_Net_EUR': synthese['Total_Net_EUR'],
+                        'Total_TVA_EUR': synthese['Total_TVA_EUR'],
+                        'Total_Brut_EUR': synthese['Total_Brut_EUR'],
+                        'Pourcentage_Global': round((synthese['Total_Net_EUR'] / sum(d.get('total_net', 0) for d in self.extracted_data if d.get('total_net'))) * 100, 2) if any(d.get('total_net') for d in self.extracted_data) else 0
+                    })
+            else:
+                # Si aucune rubrique trouvée, créer une synthèse basique
+                total_net_global = sum(d.get('total_net', 0) for d in self.extracted_data if d.get('total_net'))
+                total_tva_global = sum(d.get('total_tva', 0) for d in self.extracted_data if d.get('total_tva'))
+                total_brut_global = sum(d.get('total_brut', 0) for d in self.extracted_data if d.get('total_brut'))
+                
                 synthese_export.append({
-                    'Type_Prestation': synthese['Type_Prestation'],
-                    'Nb_Factures': len(synthese['Factures']),
-                    'Nb_Lignes_Total': synthese['Nb_Lignes_Total'],
-                    'Codes_Rubriques': ', '.join(sorted(synthese['Codes_Rubriques'])),
-                    'Total_Net_EUR': synthese['Total_Net_EUR'],
-                    'Total_TVA_EUR': synthese['Total_TVA_EUR'],
-                    'Total_Brut_EUR': synthese['Total_Brut_EUR']
+                    'Type_Prestation': 'Extraction globale',
+                    'Nb_Factures': total_factures_traitees,
+                    'Nb_Lignes_Total': sum(len(d.get('lignes_detail', [])) for d in self.extracted_data),
+                    'Codes_Rubriques': 'Non détectés',
+                    'Total_Net_EUR': total_net_global,
+                    'Total_TVA_EUR': total_tva_global,
+                    'Total_Brut_EUR': total_brut_global,
+                    'Pourcentage_Global': 100.0
                 })
             
-            if synthese_export:
-                df_synthese = pd.DataFrame(synthese_export)
-                df_synthese.to_excel(writer, sheet_name='Synthese_Prestations', index=False)
+            df_synthese = pd.DataFrame(synthese_export)
+            df_synthese.to_excel(writer, sheet_name='Synthese_Prestations', index=False)
         
         output.seek(0)
         return output
@@ -743,6 +784,18 @@ def main():
                     
                     # Génération du fichier Excel
                     st.header("💾 Export Excel")
+                    
+                    # Debug : Afficher les données avant export
+                    st.subheader("🔍 Debug - Données à exporter")
+                    total_rubriques = sum(len(d.get('rubriques_analyse', [])) for d in extracted_data)
+                    st.info(f"📊 {total_rubriques} rubriques détaillées seront exportées dans l'Excel")
+                    
+                    # Afficher un aperçu des rubriques par facture
+                    for data in extracted_data:
+                        if data.get('rubriques_analyse'):
+                            st.write(f"📄 {data['nom_fichier']}: {len(data['rubriques_analyse'])} rubriques")
+                        else:
+                            st.write(f"📄 {data['nom_fichier']}: Aucune rubrique détaillée")
                     
                     with st.spinner("Génération du fichier Excel..."):
                         excel_file = extractor.create_excel_report()
