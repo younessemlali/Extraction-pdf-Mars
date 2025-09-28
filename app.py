@@ -708,7 +708,7 @@ def main():
                         st.info("ℹ️ Aucune rubrique détaillée trouvée dans les PDFs")
                     
                     # Tableau de résultats principal
-                    st.subheader("📋 Détail des extractions")📄 Fichiers traités", len(extracted_data))
+                    st.subheader("📋 Détail des extractions")
                     
                     with col2:
                         success_count = sum(1 for d in extracted_data if d['numero_facture'])
